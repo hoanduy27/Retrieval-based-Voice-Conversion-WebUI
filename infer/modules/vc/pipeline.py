@@ -2,6 +2,7 @@ import os
 import sys
 import traceback
 import logging
+from infer.lib.audio import load_audio, wav2
 
 logger = logging.getLogger(__name__)
 
@@ -442,6 +443,228 @@ class Pipeline(object):
         audio_opt = np.concatenate(audio_opt)
         if rms_mix_rate != 1:
             audio_opt = change_rms(audio, 16000, audio_opt, tgt_sr, rms_mix_rate)
+        # if tgt_sr != resample_sr >= 16000:
+        if tgt_sr != resample_sr:
+            audio_opt = librosa.resample(
+                audio_opt, orig_sr=tgt_sr, target_sr=resample_sr
+            )
+        audio_max = np.abs(audio_opt).max() / 0.99
+        max_int16 = 32768
+        if audio_max > 1:
+            max_int16 /= audio_max
+        audio_opt = (audio_opt * max_int16).astype(np.int16)
+        del pitch, pitchf, sid
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return audio_opt
+
+
+class GuidedPipeline(Pipeline):
+    def pad_audio_with_p_len(self, audio_path):
+        audio = load_audio(audio_path, 16000)
+        audio_max = np.abs(audio).max() / 0.95
+        if audio_max > 1:
+            audio /= audio_max
+
+        audio = signal.filtfilt(bh, ah, audio)
+        audio_pad = np.pad(audio, (self.window // 2, self.window // 2), mode="reflect")
+        opt_ts = []
+        if audio_pad.shape[0] > self.t_max:
+            audio_sum = np.zeros_like(audio)
+            for i in range(self.window):
+                audio_sum += audio_pad[i : i - self.window]
+            for t in range(self.t_center, audio.shape[0], self.t_center):
+                opt_ts.append(
+                    t
+                    - self.t_query
+                    + np.where(
+                        np.abs(audio_sum[t - self.t_query : t + self.t_query])
+                        == np.abs(audio_sum[t - self.t_query : t + self.t_query]).min()
+                    )[0][0]
+                )
+        
+        t = None
+        audio_pad = np.pad(audio, (self.t_pad, self.t_pad), mode="reflect")
+        p_len = audio_pad.shape[0] // self.window
+
+        return audio_pad, p_len
+    def pipeline(
+        self,
+        model,
+        net_g,
+        sid,
+        audio,
+        input_audio_path,
+        guided_audio_path,
+        times,
+        f0_up_key,
+        f0_method,
+        file_index,
+        index_rate,
+        if_f0,
+        filter_radius,
+        tgt_sr,
+        resample_sr,
+        rms_mix_rate,
+        version,
+        protect,
+        f0_file=None,
+    ):
+        if (
+            file_index != ""
+            # and file_big_npy != ""
+            # and os.path.exists(file_big_npy) == True
+            and os.path.exists(file_index)
+            and index_rate != 0
+        ):
+            try:
+                index = faiss.read_index(file_index)
+                # big_npy = np.load(file_big_npy)
+                big_npy = index.reconstruct_n(0, index.ntotal)
+            except:
+                traceback.print_exc()
+                index = big_npy = None
+        else:
+            index = big_npy = None
+        audio = signal.filtfilt(bh, ah, audio)
+        audio_pad = np.pad(audio, (self.window // 2, self.window // 2), mode="reflect")
+        opt_ts = []
+        if audio_pad.shape[0] > self.t_max:
+            audio_sum = np.zeros_like(audio)
+            for i in range(self.window):
+                audio_sum += audio_pad[i : i - self.window]
+            for t in range(self.t_center, audio.shape[0], self.t_center):
+                opt_ts.append(
+                    t
+                    - self.t_query
+                    + np.where(
+                        np.abs(audio_sum[t - self.t_query : t + self.t_query])
+                        == np.abs(audio_sum[t - self.t_query : t + self.t_query]).min()
+                    )[0][0]
+                )
+        s = 0
+        audio_opt = []
+        t = None
+        t1 = ttime()
+        audio_pad = np.pad(audio, (self.t_pad, self.t_pad), mode="reflect")
+        p_len = audio_pad.shape[0] // self.window
+        inp_f0 = None
+        if hasattr(f0_file, "name"):
+            try:
+                with open(f0_file.name, "r") as f:
+                    lines = f.read().strip("\n").split("\n")
+                inp_f0 = []
+                for line in lines:
+                    inp_f0.append([float(i) for i in line.split(",")])
+                inp_f0 = np.array(inp_f0, dtype="float32")
+            except:
+                traceback.print_exc()
+        sid = torch.tensor(sid, device=self.device).unsqueeze(0).long()
+        pitch, pitchf = None, None
+
+        guided_audio_pad, guided_p_len = self.pad_audio_with_p_len(guided_audio_path)
+        guided_audio_pad = librosa.effects.time_stretch(
+            guided_audio_pad,
+            rate=len(guided_audio_pad)/len(audio_pad)
+        )
+
+        if if_f0 == 1:
+            pitch, pitchf = self.get_f0(
+                guided_audio_path,
+                guided_audio_pad,
+                p_len,
+                f0_up_key,
+                f0_method,
+                filter_radius,
+                inp_f0,
+            )
+            if p_len < guided_p_len:
+                # Shrink the guided pitch
+                pitch = pitch[:p_len]
+                pitchf = pitchf[:p_len]
+            else:
+                pitch = pitch
+                # Interpolate guided pitch
+            if self.device == "mps":
+                pitchf = pitchf.astype(np.float32)
+            pitch = torch.tensor(pitch, device=self.device).unsqueeze(0).long()
+            pitchf = torch.tensor(pitchf, device=self.device).unsqueeze(0).float()
+        t2 = ttime()
+        times[1] += t2 - t1
+        for t in opt_ts:
+            t = t // self.window * self.window
+            if if_f0 == 1:
+                audio_opt.append(
+                    self.vc(
+                        model,
+                        net_g,
+                        sid,
+                        audio_pad[s : t + self.t_pad2 + self.window],
+                        pitch[:, s // self.window : (t + self.t_pad2) // self.window],
+                        pitchf[:, s // self.window : (t + self.t_pad2) // self.window],
+                        times,
+                        index,
+                        big_npy,
+                        index_rate,
+                        version,
+                        protect,
+                    )[self.t_pad_tgt : -self.t_pad_tgt]
+                )
+            else:
+                audio_opt.append(
+                    self.vc(
+                        model,
+                        net_g,
+                        sid,
+                        audio_pad[s : t + self.t_pad2 + self.window],
+                        None,
+                        None,
+                        times,
+                        index,
+                        big_npy,
+                        index_rate,
+                        version,
+                        protect,
+                    )[self.t_pad_tgt : -self.t_pad_tgt]
+                )
+            s = t
+        if if_f0 == 1:
+            audio_opt.append(
+                self.vc(
+                    model,
+                    net_g,
+                    sid,
+                    audio_pad[t:],
+                    pitch[:, t // self.window :] if t is not None else pitch,
+                    pitchf[:, t // self.window :] if t is not None else pitchf,
+                    times,
+                    index,
+                    big_npy,
+                    index_rate,
+                    version,
+                    protect,
+                )[self.t_pad_tgt : -self.t_pad_tgt]
+            )
+        else:
+            audio_opt.append(
+                self.vc(
+                    model,
+                    net_g,
+                    sid,
+                    audio_pad[t:],
+                    None,
+                    None,
+                    times,
+                    index,
+                    big_npy,
+                    index_rate,
+                    version,
+                    protect,
+                )[self.t_pad_tgt : -self.t_pad_tgt]
+            )
+        audio_opt = np.concatenate(audio_opt)
+        if rms_mix_rate != 1:
+            audio_opt = change_rms(audio, 16000, audio_opt, tgt_sr, rms_mix_rate)
         if tgt_sr != resample_sr >= 16000:
             audio_opt = librosa.resample(
                 audio_opt, orig_sr=tgt_sr, target_sr=resample_sr
@@ -455,3 +678,4 @@ class Pipeline(object):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return audio_opt
+    

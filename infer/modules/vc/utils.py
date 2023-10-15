@@ -20,8 +20,14 @@ def get_index_path_from_model(sid):
 
 
 def load_hubert(config):
+    if not hasattr(config, 'hubert_model_path'):
+        hubert_model_path = "assets/hubert/hubert_base.pt"
+    else:
+        hubert_model_path = config.hubert_model_path
+
+    print(f"Loading {hubert_model_path}")
     models, _, _ = checkpoint_utils.load_model_ensemble_and_task(
-        ["assets/hubert/hubert_base.pt"],
+        [hubert_model_path],
         suffix="",
     )
     hubert_model = models[0]
